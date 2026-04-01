@@ -25,8 +25,8 @@ EMBEDDING_MODEL_NAME = "moka-ai/m3e-base"
 # DeepSeek 配置
 # 注意：DeepSeek 兼容 OpenAI 协议，所以可以使用 ChatOpenAI 类
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-DEEPSEEK_MODEL_NAME = "deepseek-chat" # 或者 "deepseek-coder"
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL")
+DEEPSEEK_MODEL_NAME = "kimi" # 或者 "deepseek-coder"
 # =================配置区域=================
 
 

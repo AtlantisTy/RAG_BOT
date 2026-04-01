@@ -10,7 +10,7 @@ from sentence_transformers import SentenceTransformer
 # =================配置区域=================
 IMAGE_LIBRARY_PATH = "./images_db"
 PERSIST_DIRECTORY = "./chroma_img_storage"
-QUERY_IMAGE_PATH = "./query_image.jpg"
+QUERY_IMAGE_PATH = "./contract1.png"
 EMBEDDING_MODEL_NAME = "sentence-transformers/clip-ViT-B-32"
 
 
