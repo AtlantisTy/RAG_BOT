@@ -1,1 +1,3 @@
 /.venv/
+/chroma_db_storage/
+/chroma_img_storage/
