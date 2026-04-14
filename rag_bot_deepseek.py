@@ -1,100 +1,82 @@
 import os
 import re
+import pickle
+from typing import List
 
+import yaml
 from dotenv import load_dotenv
 from langchain_chroma import Chroma
 from langchain_classic.chains.retrieval_qa.base import RetrievalQA
 from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
 from langchain_core.documents import Document
-from langchain_core.prompts import PromptTemplate
+from langchain_core.retrievers import BaseRetriever
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_openai import ChatOpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from rank_bm25 import BM25Okapi
+from sentence_transformers import CrossEncoder
 
 from prompt import rag_prompt
 
 # 加载 .env 环境变量
 load_dotenv()
 
-# =================配置区域=================
-PERSIST_DIRECTORY = "./chroma_db_storage"
-DATA_PATH = "./doc"
+# =================配置加载=================
+with open("config.yaml", "r", encoding="utf-8") as f:
+    CFG = yaml.safe_load(f)
 
-# Embedding 模型 (依然推荐本地运行，节省 Token 费用且速度快)
-EMBEDDING_MODEL_NAME = "moka-ai/m3e-base"
+DATA_PATH = CFG["data_path"]
+PERSIST_DIRECTORY = CFG["persist_directory"]
+REBUILD_DB = CFG["rebuild_db"]
 
-# DeepSeek 配置
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-DEEPSEEK_MODEL_NAME = "kimi"  # 或者 "deepseek-coder"
+EMBEDDING_CFG = CFG["embedding"]
+SPLITTER_CFG = CFG["text_splitter"]
+RETRIEVAL_CFG = CFG["retrieval"]
+RERANK_CFG = CFG["rerank"]
+LLM_CFG = CFG["llm"]
+META_CFG = CFG["metadata"]
 
-# 元数据默认值
-DEFAULT_DEPARTMENT = "人事"
-DEFAULT_EFFECTIVE_DATE = "2026-01-01"
-DEFAULT_STATUS = "valid"
-# =================配置区域=================
+DEEPSEEK_API_KEY = os.getenv(LLM_CFG["api_key_env"])
+DEEPSEEK_BASE_URL = os.getenv(LLM_CFG["base_url_env"], LLM_CFG["default_base_url"])
+# =================配置加载=================
 
 
-def extract_doc_type(file_path):
+def extract_doc_type(file_path: str) -> str:
     """从文件名提取 doc_type，去掉扩展名"""
     base = os.path.basename(file_path)
     name, _ = os.path.splitext(base)
     return name
 
 
-def extract_chapter_section(text):
-    """
-    从文本开头提取章节信息。
-    匹配模式（按优先级）：
-      - 第一部分 / 第二部分 / 第一章 等
-      - 一、二、三、 或 一. 二. 等
-      - 1.  1.1  1.1.1  等
-      - (1) (2) 等
-    返回 (chapter, section)
-    """
-    # 取文本前 300 字符进行匹配，避免全文扫描
+def extract_chapter_section(text: str):
+    """从文本开头提取章节信息"""
     head = text[:300].strip()
 
-    # 匹配 "第一部分 xxx" / "第二部分 xxx" / "第一章 xxx"
     part_pattern = re.compile(r"^(第[一二三四五六七八九十\d]+[部分章节])[\s、.:：]*(.{0,30})")
     m = part_pattern.search(head)
     if m:
-        chapter = m.group(1).strip()
-        section = m.group(2).strip()
-        return chapter, section
+        return m.group(1).strip(), m.group(2).strip()
 
-    # 匹配 "一、xxx" / "二、xxx" / "一. xxx"
     chinese_num_pattern = re.compile(r"^([一二三四五六七八九十])[、.．\s]+(.{0,30})")
     m = chinese_num_pattern.search(head)
     if m:
-        chapter = m.group(1) + "、"
-        section = m.group(2).strip()
-        return chapter, section
+        return m.group(1) + "、", m.group(2).strip()
 
-    # 匹配 "1. xxx" / "1.1 xxx" / "1.1.1 xxx"
     arabic_num_pattern = re.compile(r"^(\d+(?:\.\d+)*)[\s.．]+(.{0,30})")
     m = arabic_num_pattern.search(head)
     if m:
-        chapter = m.group(1).strip()
-        section = m.group(2).strip()
-        return chapter, section
+        return m.group(1).strip(), m.group(2).strip()
 
-    # 匹配 "(1) xxx" / "(2) xxx"
     bracket_pattern = re.compile(r"^(\(\d+\))[\s.．]*(.{0,30})")
     m = bracket_pattern.search(head)
     if m:
-        chapter = m.group(1).strip()
-        section = m.group(2).strip()
-        return chapter, section
+        return m.group(1).strip(), m.group(2).strip()
 
     return None, None
 
 
-def split_documents_with_metadata(documents):
-    """
-    使用策略 B：先按层级标题切分，再为每个切片附加元数据。
-    """
-    # 定义分隔符：优先按大标题切分，再按小标题
+def split_documents_with_metadata(documents: List[Document]) -> List[Document]:
+    """按层级标题切分，并为每个切片附加元数据"""
     separators = [
         "\n第一部分 ", "\n第二部分 ", "\n第三部分 ", "\n第四部分 ", "\n第五部分 ",
         "\n第一章 ", "\n第二章 ", "\n第三章 ", "\n第四章 ", "\n第五章 ",
@@ -107,8 +89,8 @@ def split_documents_with_metadata(documents):
     ]
 
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50,
+        chunk_size=SPLITTER_CFG["chunk_size"],
+        chunk_overlap=SPLITTER_CFG["chunk_overlap"],
         separators=separators,
         is_separator_regex=False,
     )
@@ -118,14 +100,11 @@ def split_documents_with_metadata(documents):
         base_meta = {
             "source": doc.metadata.get("source", ""),
             "doc_type": extract_doc_type(doc.metadata.get("source", "")),
-            "department": DEFAULT_DEPARTMENT,
-            "effective_date": DEFAULT_EFFECTIVE_DATE,
-            "status": DEFAULT_STATUS,
+            "department": META_CFG["department"],
+            "effective_date": META_CFG["effective_date"],
+            "status": META_CFG["status"],
         }
-
-        # 先对该文档进行切分
         splits = text_splitter.split_documents([doc])
-
         for split in splits:
             chapter, section = extract_chapter_section(split.page_content)
             split.metadata.update(base_meta)
@@ -138,64 +117,180 @@ def split_documents_with_metadata(documents):
     return all_splits
 
 
+class HybridRetriever:
+    """多路召回检索器：向量检索 + BM25 检索 + RRF 融合 + Cross-Encoder 重排"""
+
+    def __init__(self, vectordb, documents: List[Document], rerank_model=None):
+        self.vectordb = vectordb
+        self.documents = documents
+        self.doc_map = {doc.metadata.get("source", "") + "_" + str(i): doc for i, doc in enumerate(documents)}
+        # BM25 初始化
+        tokenized_corpus = [self._tokenize(doc.page_content) for doc in documents]
+        self.bm25 = BM25Okapi(tokenized_corpus)
+        self.rerank_model = rerank_model
+
+    def _tokenize(self, text: str) -> List[str]:
+        """简单中文分词：按字符切分，BM25 对中文足够有效"""
+        return list(text.strip())
+
+    def _vector_search(self, query: str, k: int) -> List[Document]:
+        return self.vectordb.similarity_search(query, k=k)
+
+    def _bm25_search(self, query: str, k: int) -> List[Document]:
+        tokenized_query = self._tokenize(query)
+        scores = self.bm25.get_scores(tokenized_query)
+        top_k_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
+        return [self.documents[i] for i in top_k_indices]
+
+    @staticmethod
+    def _rrf_fuse(results_list: List[List[Document]], k: int = 60) -> List[Document]:
+        """RRF 融合多路召回结果"""
+        scores = {}
+        doc_id_map = {}
+        for results in results_list:
+            for rank, doc in enumerate(results):
+                doc_id = id(doc)
+                doc_id_map[doc_id] = doc
+                scores[doc_id] = scores.get(doc_id, 0) + 1 / (k + rank + 1)
+
+        sorted_docs = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        return [doc_id_map[doc_id] for doc_id, _ in sorted_docs]
+
+    def _rerank(self, query: str, documents: List[Document], top_k: int) -> List[Document]:
+        if not self.rerank_model or len(documents) == 0:
+            return documents[:top_k]
+        pairs = [(query, doc.page_content) for doc in documents]
+        scores = self.rerank_model.predict(pairs)
+        scored_docs = list(zip(documents, scores))
+        scored_docs.sort(key=lambda x: x[1], reverse=True)
+        return [doc for doc, _ in scored_docs[:top_k]]
+
+    def retrieve(self, query: str) -> List[Document]:
+        vector_k = RETRIEVAL_CFG["vector_top_k"]
+        bm25_k = RETRIEVAL_CFG["bm25_top_k"]
+        fusion_k = RETRIEVAL_CFG["fusion_top_k"]
+        final_k = RETRIEVAL_CFG["final_top_k"]
+
+        vector_results = self._vector_search(query, vector_k)
+        bm25_results = self._bm25_search(query, bm25_k)
+
+        fused_results = self._rrf_fuse([vector_results, bm25_results])
+        fused_results = fused_results[:fusion_k]
+
+        final_results = self._rerank(query, fused_results, final_k)
+        return final_results
+
+
+def build_vectordb(splits: List[Document], embeddings):
+    """构建或加载向量数据库"""
+    if REBUILD_DB or not os.path.exists(PERSIST_DIRECTORY) or not os.listdir(PERSIST_DIRECTORY):
+        print("正在构建向量数据库...")
+        vectordb = Chroma.from_documents(
+            documents=splits,
+            embedding=embeddings,
+            persist_directory=PERSIST_DIRECTORY,
+        )
+        # 保存 splits 用于 BM25
+        with open(os.path.join(PERSIST_DIRECTORY, "documents.pkl"), "wb") as f:
+            pickle.dump(splits, f)
+        print("向量数据库构建完成并已持久化。")
+    else:
+        print("正在加载已有向量数据库...")
+        vectordb = Chroma(
+            persist_directory=PERSIST_DIRECTORY,
+            embedding_function=embeddings,
+        )
+        print("向量数据库加载完成。")
+    return vectordb
+
+
+def load_documents():
+    """加载持久化的 documents，用于 BM25"""
+    pkl_path = os.path.join(PERSIST_DIRECTORY, "documents.pkl")
+    if os.path.exists(pkl_path):
+        with open(pkl_path, "rb") as f:
+            return pickle.load(f)
+    return None
+
+
 def main():
-    # 1. 检查 API Key
     if not DEEPSEEK_API_KEY:
         print("错误：未找到 DEEPSEEK_API_KEY。请检查 .env 文件或环境变量。")
         return
 
     print("正在启动基于 DeepSeek 的文档问答机器人...")
 
-    # 2. 加载 PDF 文档
-    if not os.path.exists(DATA_PATH):
-        print(f"目录 {DATA_PATH} 不存在，请先创建该目录并放入 PDF 文件。")
-        return
-
-    loader = DirectoryLoader(
-        DATA_PATH,
-        glob="**/*.pdf",
-        loader_cls=PyPDFLoader,
-        show_progress=True,
-        use_multithreading=True,
-    )
-    documents = loader.load()
-    print(f"已加载 {len(documents)} 页 PDF 内容。")
-
-    # 3. 切分并附加元数据
-    splits = split_documents_with_metadata(documents)
-    print(f"文本已分割为 {len(splits)} 个片段。")
-
-    # 4. 初始化 Embedding 模型 (本地)
-    print(f"加载本地 Embedding 模型：{EMBEDDING_MODEL_NAME}...")
+    # 1. 加载 Embedding 模型
+    print(f"加载本地 Embedding 模型：{EMBEDDING_CFG['model_name']}...")
     embeddings = HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL_NAME,
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True},
+        model_name=EMBEDDING_CFG["model_name"],
+        model_kwargs={"device": EMBEDDING_CFG["device"]},
+        encode_kwargs={"normalize_embeddings": EMBEDDING_CFG["normalize_embeddings"]},
     )
 
-    # 5. 创建/加载向量数据库
-    vectordb = Chroma.from_documents(
-        documents=splits,
-        embedding=embeddings,
-        persist_directory=PERSIST_DIRECTORY,
-    )
-    print("向量数据库就绪。")
+    splits = None
+    if REBUILD_DB:
+        if not os.path.exists(DATA_PATH):
+            print(f"目录 {DATA_PATH} 不存在，请先创建该目录并放入 PDF 文件。")
+            return
 
-    # 6. 初始化 DeepSeek LLM
-    print(f"正在连接 DeepSeek 模型 ({DEEPSEEK_MODEL_NAME})...")
+        loader = DirectoryLoader(
+            DATA_PATH,
+            glob="**/*.pdf",
+            loader_cls=PyPDFLoader,
+            show_progress=True,
+            use_multithreading=True,
+        )
+        documents = loader.load()
+        print(f"已加载 {len(documents)} 页 PDF 内容。")
+
+        splits = split_documents_with_metadata(documents)
+        print(f"文本已分割为 {len(splits)} 个片段。")
+    else:
+        splits = load_documents()
+        if splits is None:
+            print("错误：未找到已持久化的文档数据，请将 rebuild_db 设为 true 重新构建。")
+            return
+        print(f"已从缓存加载 {len(splits)} 个文档片段。")
+
+    # 2. 构建/加载向量数据库
+    vectordb = build_vectordb(splits, embeddings)
+
+    # 3. 初始化重排模型
+    rerank_model = None
+    if RERANK_CFG["enabled"]:
+        print(f"加载重排模型：{RERANK_CFG['model_name']}...")
+        rerank_model = CrossEncoder(RERANK_CFG["model_name"], device=EMBEDDING_CFG["device"])
+
+    # 4. 初始化混合检索器
+    hybrid_retriever = HybridRetriever(vectordb, splits, rerank_model=rerank_model)
+
+    # 5. 初始化 LLM
+    print(f"正在连接 DeepSeek 模型 ({LLM_CFG['model_name']})...")
     llm = ChatOpenAI(
-        model=DEEPSEEK_MODEL_NAME,
+        model=LLM_CFG["model_name"],
         api_key=DEEPSEEK_API_KEY,
         base_url=DEEPSEEK_BASE_URL,
-        temperature=0.3,
-        max_tokens=1024,
+        temperature=LLM_CFG["temperature"],
+        max_tokens=LLM_CFG["max_tokens"],
     )
 
-    # 7. 构建检索问答链
+    # 6. 自定义检索问答链（使用混合检索器）
+    class CustomRetriever(BaseRetriever):
+        retriever: HybridRetriever
+
+        def _get_relevant_documents(self, query: str) -> List[Document]:
+            return self.retriever.retrieve(query)
+
+        async def _aget_relevant_documents(self, query: str) -> List[Document]:
+            return self._get_relevant_documents(query)
+
+    custom_retriever = CustomRetriever(retriever=hybrid_retriever)
+
     qa_chain = RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
-        retriever=vectordb.as_retriever(search_kwargs={"k": 3}),
+        retriever=custom_retriever,
         return_source_documents=True,
         chain_type_kwargs={"prompt": rag_prompt},
     )

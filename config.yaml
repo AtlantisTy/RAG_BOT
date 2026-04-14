@@ -1,0 +1,50 @@
+# RAG 系统配置文件
+
+# 数据路径
+data_path: "./doc"
+persist_directory: "./chroma_db_storage"
+
+# 是否重新构建向量库（true: 重新加载PDF、切片、入库；false: 直接加载已有库）
+rebuild_db: false
+
+# Embedding 模型配置
+embedding:
+  model_name: "moka-ai/m3e-base"
+  device: "cpu"
+  normalize_embeddings: true
+
+# 文本切分配置
+text_splitter:
+  chunk_size: 500
+  chunk_overlap: 50
+
+# 检索配置
+retrieval:
+  # 向量检索召回数量
+  vector_top_k: 5
+  # BM25 文本检索召回数量
+  bm25_top_k: 5
+  # 融合后进入重排的数量
+  fusion_top_k: 10
+  # 最终返回给 LLM 的文档数量
+  final_top_k: 3
+
+# 重排模型配置（使用 Cross-Encoder）
+rerank:
+  enabled: true
+  model_name: "BAAI/bge-reranker-base"
+
+# LLM 配置
+llm:
+  api_key_env: "DEEPSEEK_API_KEY"
+  base_url_env: "DEEPSEEK_BASE_URL"
+  default_base_url: "https://api.deepseek.com"
+  model_name: "kimi"
+  temperature: 0.3
+  max_tokens: 1024
+
+# 元数据默认值
+metadata:
+  department: "人事"
+  effective_date: "2026-01-01"
+  status: "valid"
